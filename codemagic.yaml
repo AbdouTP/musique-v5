@@ -1,0 +1,158 @@
+# Codemagic — Freetify Musique
+# Deux workflows :
+#   1. freetify-unsigned : compile SANS signature et produit un IPA non signé
+#      (à signer ensuite avec AltStore / Sideloadly et ton compte Apple gratuit).
+#   2. freetify-signed   : compile ET signe l'IPA (nécessite un certificat de
+#      développement + un profil de provisioning fournis par toi en variables secrètes).
+# Aucun certificat, clé privée ou mot de passe n'est stocké dans ce dépôt.
+
+workflows:
+
+  freetify-unsigned:
+    name: "1 - Compilation sans signature (IPA pour AltStore)"
+    instance_type: mac_mini_m2
+    max_build_duration: 45
+    environment:
+      xcode: latest
+      vars:
+        PROJECT_FILE: FreetifyMusique.xcodeproj
+        SCHEME: FreetifyMusique
+    scripts:
+      - name: Installer XcodeGen
+        script: |
+          set -e
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Générer le projet Xcode
+        script: |
+          set -e
+          xcodegen generate --spec project.yml
+          ls -la "$PROJECT_FILE"
+
+      - name: Tests unitaires (non bloquants)
+        ignore_failure: true
+        script: |
+          set -o pipefail
+          mkdir -p build/logs
+          UDID=$(python3 scripts/pick_simulator.py)
+          echo "Simulateur choisi : $UDID"
+          xcodebuild test \
+            -project "$PROJECT_FILE" \
+            -scheme "$SCHEME" \
+            -destination "id=$UDID" \
+            -derivedDataPath build/DerivedDataTests \
+            CODE_SIGNING_ALLOWED=NO \
+            2>&1 | tee build/logs/tests.log \
+            || { echo "=== TESTS EN ECHEC ==="; grep -E "error:|failed" build/logs/tests.log | sort -u | head -50; exit 1; }
+
+      - name: Compiler l'application (iPhone, sans signature)
+        script: |
+          set -o pipefail
+          mkdir -p build/logs
+          xcodebuild \
+            -project "$PROJECT_FILE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build/logs/build.log \
+            || {
+              echo ""
+              echo "=================== ERREURS DE COMPILATION ==================="
+              grep -E "error:" build/logs/build.log | sort -u
+              echo "=============================================================="
+              exit 1
+            }
+
+      - name: Créer le .app.zip et l'IPA non signé
+        script: |
+          set -e
+          APP=$(find build/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          if [ -z "$APP" ]; then echo "Aucun .app trouvé"; exit 1; fi
+          echo "App : $APP"
+          mkdir -p build/artifacts build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          (cd build/ipa && zip -qry "$CM_BUILD_DIR/build/artifacts/FreetifyMusique-unsigned.ipa" Payload)
+          (cd "$(dirname "$APP")" && zip -qry "$CM_BUILD_DIR/build/artifacts/FreetifyMusique.app.zip" "$(basename "$APP")")
+          unzip -l build/artifacts/FreetifyMusique-unsigned.ipa | head -20
+          ls -lh build/artifacts
+
+    artifacts:
+      - build/artifacts/*.ipa
+      - build/artifacts/*.zip
+      - build/logs/*.log
+
+  freetify-signed:
+    name: "2 - Compilation signée (IPA installable)"
+    instance_type: mac_mini_m2
+    max_build_duration: 45
+    environment:
+      xcode: latest
+      # Crée un groupe de variables "signing" dans Codemagic (Teams > Global variables
+      # and secrets) avec les variables SECRÈTES suivantes :
+      #   CM_CERTIFICATE            certificat .p12 encodé en base64
+      #   CM_CERTIFICATE_PASSWORD   mot de passe du .p12
+      #   CM_PROVISIONING_PROFILE   profil .mobileprovision encodé en base64
+      groups:
+        - signing
+      vars:
+        PROJECT_FILE: FreetifyMusique.xcodeproj
+        SCHEME: FreetifyMusique
+    scripts:
+      - name: Installer XcodeGen
+        script: |
+          set -e
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+
+      - name: Générer le projet Xcode
+        script: xcodegen generate --spec project.yml
+
+      - name: Initialiser le trousseau
+        script: keychain initialize
+
+      - name: Importer le certificat
+        script: |
+          set -e
+          echo "$CM_CERTIFICATE" | base64 --decode > /tmp/certificate.p12
+          keychain add-certificates \
+            --certificate /tmp/certificate.p12 \
+            --certificate-password "$CM_CERTIFICATE_PASSWORD"
+          rm -f /tmp/certificate.p12
+
+      - name: Importer le profil de provisioning
+        script: |
+          set -e
+          PROFILES_HOME="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PROFILES_HOME"
+          echo "$CM_PROVISIONING_PROFILE" | base64 --decode > "$PROFILES_HOME/freetify.mobileprovision"
+
+      - name: Appliquer les profils au projet
+        script: xcode-project use-profiles
+
+      - name: Compiler et exporter l'IPA signé
+        script: |
+          set -o pipefail
+          mkdir -p build/logs
+          xcode-project build-ipa \
+            --project "$PROJECT_FILE" \
+            --scheme "$SCHEME" \
+            2>&1 | tee build/logs/build-ipa.log \
+            || {
+              echo "=================== ERREURS ==================="
+              grep -E "error:" build/logs/build-ipa.log | sort -u
+              exit 1
+            }
+
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - build/logs/*.log
+      - /tmp/xcodebuild_logs/*.log
